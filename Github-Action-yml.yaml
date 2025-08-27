@@ -1,0 +1,102 @@
+name: Build & Deploy Web App API (MyProject-API)  # Name of GitHub Actions workflow
+
+on:
+  push:
+    branches:
+      - feature/Source  # Trigger workflow on push to this branch
+  workflow_dispatch:  # Allow manual triggering of the workflow
+
+env:
+  DOTNET_VERSION: '8.0.100'  # .NET SDK version to use
+  DOTNET_ROOT: "'C:\\Program Files\\dotnet'"  # Path to .NET installation on self-hosted runner
+  DOCKER_IMAGE: myproject-api:${{ github.run_number }}  # Docker image name with GitHub run number as tag
+  K8S_NAMESPACE: qa  # Kubernetes namespace for deployment
+
+jobs:
+  build:
+    runs-on: self-hosted  # Use self-hosted runner for build
+    environment: qa  # Environment context in GitHub (used for approvals/secrets)
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4  # Checkout the code from GitHub repository
+
+      - name: Set up .NET Core
+        uses: actions/setup-dotnet@v4  # Set up .NET SDK on runner
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}  # Version of .NET SDK to install
+
+      - name: Restore dependencies
+        run: dotnet restore MyProject.WebApi/  # Restore NuGet packages for the project
+
+      - name: Build with dotnet
+        run: dotnet build MyProject.WebApi/ -c Release  # Compile the project in Release configuration
+
+      - name: Run Unit Tests
+        run: dotnet test MyProject.WebApi.Tests/ -c Release --no-build  # Run unit tests (without rebuilding)
+
+      - name: Publish Web API
+        run: dotnet publish MyProject.WebApi/ -c Release -o ./publish  # Publish compiled app to ./publish folder
+
+      - name: Remove app settings from new build
+        run: |
+          cd publish
+          del appsettings.Development.json  # Remove development-specific settings
+          del appsettings.json  # Remove default appsettings file to avoid overwriting production settings
+
+      - name: Zip Published Files
+        shell: powershell
+        run: |
+          Compress-Archive -Path ./publish/* -DestinationPath MyProject-API-${{ github.run_number }}.zip  # Zip the published output for artifact storage
+
+      - name: Upload artifact for manual download
+        uses: actions/upload-artifact@v4  # Upload zip artifact to GitHub for download
+        with:
+          name: MyProject-API-${{ github.run_number }}  # Artifact name
+          path: MyProject-API-${{ github.run_number }}.zip  # Path to artifact
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ env.DOCKER_IMAGE }} ./publish  # Build Docker image from published app
+
+      - name: Scan Docker Image with Trivy
+        uses: aquasecurity/trivy-action@v2  # Scan Docker image for vulnerabilities using Trivy
+        with:
+          image-ref: ${{ env.DOCKER_IMAGE }}  # Docker image to scan
+          format: 'table'  # Display results as table
+          exit-code: '1'  # Fail workflow if vulnerabilities are found
+          severity: 'CRITICAL,HIGH,MEDIUM'  # Check for these severity levels only
+
+      - name: Test Docker Image
+        run: |
+          docker run --rm -p 5000:80 ${{ env.DOCKER_IMAGE }}  # Run Docker container to test locally
+
+  deploy:
+    needs: build  # Ensure deployment only starts after build job completes
+    runs-on: self-hosted  # Use self-hosted runner for deployment
+    environment: qa  # Deployment environment context
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4  # Download previously uploaded build artifact
+        with:
+          name: MyProject-API-${{ github.run_number }}  # Artifact name to download
+          path: C:\deploy\MyProject-API  # Destination path on runner
+
+      - name: Ensure Backup Directory Exists
+        shell: powershell
+        run: |
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"  # Generate timestamp
+          $backupFolder = "C:\COEUS-Code_drop\Backup\MyProject-API-$timestamp"  # Backup folder path
+
+          if (-not (Test-Path "C:\COEUS-Code_drop\Backup")) {  # Check if backup root exists
+            New-Item -ItemType Directory -Path "C:\COEUS-Code_drop\Backup"  # Create root backup directory if missing
+          }
+
+          if (-not (Test-Path "C:\inetpub\wwwroot\coeus\MyProject-API")) {  # If first deployment
+            Write-Host "🚀 First deployment detected, creating backup before first deployment."  # Log message
+            Copy-Item "C:\deploy\MyProject-API" $backupFolder -Recurse -Force  # Copy files to backup
+          }
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f k8s/myproject-api-deployment.yaml -n ${{ env.K8S_NAMESPACE }}  # Deploy/update Deployment manifest
+          kubectl apply -f k8s/myproject-api-service.yaml -n ${{ env.K8S_NAMESPACE }}  # Deploy/update Service manifest
